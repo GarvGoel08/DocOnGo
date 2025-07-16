@@ -1,6 +1,12 @@
 import { useRef, useState, useEffect } from "react";
-import { Link } from "react-router-dom";
-import { sendDoctorMessage, resetDoctorSession, getDoctorSessionStatus } from "../api/doctor";
+import { Link, useSearchParams } from "react-router-dom";
+import { sendDoctorMessage, resetDoctorSession, getDoctorSessionStatus, loadConversation } from "../api/doctor";
+import { useAuth } from "../contexts/AuthContext";
+import { useGeminiApiKey } from "../contexts/GeminiApiKeyContext";
+import AuthModal from "./AuthModal";
+import ApiKeyModal from "./ApiKeyModal";
+import ChatHistory from "./ChatHistory";
+import ReactMarkdown from 'react-markdown';
 
 function randomSessionId() {
   return "sess-" + Math.random().toString(36).slice(2, 12);
@@ -52,7 +58,6 @@ const CHAT_STAGES = [
   "SYMPTOM_COLLECTION",
   "DETAILED_ASSESSMENT",
   "MEDICAL_HISTORY",
-  "ANALYSIS",
   "RECOMMENDATIONS",
   "FOLLOW_UP",
 ];
@@ -64,9 +69,10 @@ function getStageProgress(stage) {
   // Find the stage index by matching text
   const currentIndex = CHAT_STAGES.findIndex(
     (s) =>
-      stage.toLowerCase().includes(s.replace(/_/g, "")) ||
-      stage.toLowerCase() === s
+      stage.toUpperCase().includes(s.replace(/_/g, "")) ||
+      stage.toUpperCase() === s
   );
+  console.log("Current stage:", stage, "Index:", currentIndex);
 
   if (currentIndex === -1) return 20; // Default progress if not found
   return Math.min(
@@ -103,7 +109,11 @@ const animationStyles = `
 `;
 
 export default function DoctorChat() {
-  const [sessionId] = useState(randomSessionId());
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [sessionId, setSessionId] = useState(() => {
+    // Check if sessionId is in URL params, otherwise generate new one
+    return searchParams.get('session') || randomSessionId();
+  });
   const [messages, setMessages] = useState([
     { from: "ai", text: "Hello! I am Dr. AI. How can I help you today?" },
   ]);
@@ -115,18 +125,73 @@ export default function DoctorChat() {
     confidence_level: 0.95,
     detected_symptoms: [],
   });
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [showChatHistory, setShowChatHistory] = useState(false);
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const { user, token, logout } = useAuth();
+  const { 
+    apiKey, 
+    hasApiKey, 
+    needsApiKey, 
+    saveApiKey, 
+    getApiKeyForRequest 
+  } = useGeminiApiKey();
   const chatEndRef = useRef(null);
+
+  // Check for API key on component mount
+  useEffect(() => {
+    if (needsApiKey()) {
+      setShowApiKeyModal(true);
+    }
+  }, [needsApiKey]);
+
+  // Update URL when sessionId changes
+  useEffect(() => {
+    setSearchParams({ session: sessionId });
+  }, [sessionId, setSearchParams]);
 
   // Scroll to bottom whenever messages change
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Load conversation if sessionId is provided
+  useEffect(() => {
+    async function loadExistingConversation() {
+      const sessionFromUrl = searchParams.get('session');
+      if (sessionFromUrl && sessionFromUrl !== sessionId) {
+        setSessionId(sessionFromUrl);
+        try {
+          const conversation = await loadConversation(sessionFromUrl, token);
+          if (conversation && conversation.messages.length > 0) {
+            // Convert MongoDB messages to chat format
+            const chatMessages = conversation.messages.map(msg => ({
+              from: msg.role === 'assistant' ? 'ai' : 'user',
+              text: msg.content
+            }));
+            
+            setMessages(chatMessages);
+            setMetadata({
+              stage: conversation.stage || CHAT_STAGES[0],
+              confidence_level: 0.8,
+              detected_symptoms: conversation.detectedSymptoms || [],
+              suggested_followup: ""
+            });
+          }
+        } catch (error) {
+          console.error('Error loading conversation:', error);
+        }
+      }
+    }
+
+    loadExistingConversation();
+  }, [searchParams, token]);
+
   // Check session status on component load
   useEffect(() => {
     async function checkSessionStatus() {
       try {
-        const status = await getDoctorSessionStatus(sessionId);
+        const status = await getDoctorSessionStatus(sessionId, token);
         
         if (status.exists) {
           // Update metadata with session info
@@ -136,13 +201,6 @@ export default function DoctorChat() {
             detected_symptoms: status.detectedSymptoms || [],
             suggested_followup: ""
           });
-          
-          // Add a message about continuing the conversation
-          if (messages.length === 1) {
-            setMessages([
-              { from: "ai", text: "Hello! I am Dr. AI. I see we were having a conversation. How can I continue helping you today?" }
-            ]);
-          }
         }
       } catch (error) {
         console.error("Error checking session status:", error);
@@ -151,7 +209,7 @@ export default function DoctorChat() {
     }
     
     checkSessionStatus();
-  }, [sessionId]);
+  }, [sessionId, token]);
 
   async function handleSend(e) {
     e.preventDefault();
@@ -176,7 +234,8 @@ export default function DoctorChat() {
       // Use the API function from the separate API file
       const response = await sendDoctorMessage({ 
         message: userMsg, 
-        sessionId 
+        sessionId,
+        token 
       });
 
       // Remove typing indicator before showing real message
@@ -218,7 +277,11 @@ export default function DoctorChat() {
   async function handleReset() {
     try {
       // Call the API to reset the session
-      await resetDoctorSession(sessionId);
+      await resetDoctorSession(sessionId, token);
+      
+      // Generate new session ID for fresh start
+      const newSessionId = randomSessionId();
+      setSessionId(newSessionId);
       
       // Reset the local state
       setMessages([
@@ -236,6 +299,27 @@ export default function DoctorChat() {
       setError("Failed to reset the conversation. Please try again.");
     }
   }
+
+  const handleSelectChat = (selectedSessionId) => {
+    setSessionId(selectedSessionId);
+    setSearchParams({ session: selectedSessionId });
+  };
+
+  const startNewChat = () => {
+    const newSessionId = randomSessionId();
+    setSessionId(newSessionId);
+    setSearchParams({ session: newSessionId });
+    setMessages([
+      { from: "ai", text: "Hello! I am Dr. AI. How can I help you today?" },
+    ]);
+    setError("");
+    setMetadata({
+      stage: CHAT_STAGES[0],
+      confidence_level: 0.95,
+      detected_symptoms: [],
+      suggested_followup: ""
+    });
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50 flex items-center justify-center p-4">
@@ -272,6 +356,80 @@ export default function DoctorChat() {
               </div>
             </div>
             <div className="flex items-center gap-2">
+              {user ? (
+                <>
+                  <button
+                    onClick={() => setShowChatHistory(true)}
+                    className="bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded-md text-sm transition-colors duration-200 flex items-center gap-1"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      className="h-4 w-4"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+                      />
+                    </svg>
+                    History
+                  </button>
+                  <button
+                    onClick={startNewChat}
+                    className="bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded-md text-sm transition-colors duration-200 flex items-center gap-1"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      className="h-4 w-4"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M12 6v6m0 0v6m0-6h6m-6 0H6"
+                      />
+                    </svg>
+                    New
+                  </button>
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="hidden sm:inline">Hi, {user.name}</span>
+                    <button
+                      onClick={logout}
+                      className="bg-white/20 hover:bg-white/30 text-white px-3 py-1.5 rounded-md text-sm transition-colors duration-200"
+                    >
+                      Logout
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <button
+                  onClick={() => setShowAuthModal(true)}
+                  className="bg-white/20 hover:bg-white/30 text-white px-4 py-1.5 rounded-md text-sm transition-colors duration-200 flex items-center gap-1"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    className="h-4 w-4"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+                    />
+                  </svg>
+                  Login
+                </button>
+              )}
               <button
                 className="bg-white/20 hover:bg-white/30 text-white px-4 py-1.5 rounded-md text-sm transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
                 onClick={handleReset}
@@ -295,6 +453,11 @@ export default function DoctorChat() {
               </button>
             </div>
           </div>
+          {!user && (
+            <div className="mt-2 text-xs text-blue-100 text-center">
+              💡 Login to save your conversations and access them later
+            </div>
+          )}
         </div>
 
         {/* Stage info */}
@@ -446,7 +609,11 @@ export default function DoctorChat() {
                     {i === 0 && msg.from === "ai" ? (
                       <span>👋 {msg.text}</span>
                     ) : (
-                      <span className="whitespace-pre-wrap">{msg.text}</span>
+                      <div className="w-full h-full text-start">
+                        <ReactMarkdown >
+                        {msg.text}
+                      </ReactMarkdown>
+                        </div>
                     )}
                   </div>
                 )}
@@ -571,6 +738,27 @@ export default function DoctorChat() {
           </p>
         </div>
       </div>
+
+      {/* Auth Modal */}
+      <AuthModal 
+        isOpen={showAuthModal} 
+        onClose={() => setShowAuthModal(false)} 
+      />
+
+      {/* API Key Modal */}
+      <ApiKeyModal
+        isOpen={showApiKeyModal}
+        onClose={() => setShowApiKeyModal(false)}
+        apiKey={apiKey}
+        setApiKey={setApiKey}
+      />
+
+      {/* Chat History Modal */}
+      <ChatHistory 
+        isOpen={showChatHistory} 
+        onClose={() => setShowChatHistory(false)}
+        onSelectChat={handleSelectChat}
+      />
     </div>
   );
 }
