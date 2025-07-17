@@ -1,5 +1,5 @@
 // Doctor chat API calls
-const API_BASE = import.meta.env.VITE_API_BASE? process.env.VITE_API_BASE + '/api/conversation' : 'http://localhost:5000/api/conversation';
+const API_BASE = import.meta.env.VITE_API_BASE? import.meta.env.VITE_API_BASE + '/api/conversation' : 'http://localhost:5000/api/conversation';
 
 // Helper function to get auth headers
 function getAuthHeaders(token = null, apiKey = null) {
